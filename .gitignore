@@ -8,7 +8,7 @@ profile.json
 .env.*
 !.env.example
 .ipynb_checkpoints/
-autha-worker/
+/autha-worker/
 .nusuk-captcha.pid
 nusuk-captcha.log
 .wrangler/

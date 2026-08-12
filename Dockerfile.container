@@ -72,6 +72,11 @@ RUN mkdir -p /run/sshd \
   && sed -i 's/^#PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config \
   && sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 
+# Generate SSH host keys at build time so sshd can start without root keygen at runtime.
+# The startup script runs as root to launch sshd, then drops to the toque user for the
+# Node.js server (see startup.sh below).
+RUN ssh-keygen -A
+
 # Authorized keys are injected at runtime via the TOQUE_SSH_KEYS env var
 # (set by the Worker's envVars) or mounted as a secret. The startup script
 # reads them and writes to ~/.ssh/authorized_keys.
@@ -84,15 +89,19 @@ EXPOSE 2222
 # ─── tigrisfs (R2 FUSE mount) ─────────────────────────────────────────
 # Install tigrisfs binary for mounting R2 buckets as a filesystem.
 # This enables the container to read/write R2 objects as local files at
-# /mnt/r2 without S3 API calls.
-RUN ARCH=$(uname -m) && \
+# /mnt/r2 without S3 API calls. The install is best-effort: if the GitHub
+# API is rate-limited or the download fails, the build still succeeds and
+# the R2 mount is simply skipped at runtime (startup.sh checks for the binary).
+RUN set -e; \
+  ARCH=$(uname -m) && \
   if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
   if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
-  VERSION=$(curl -s https://api.github.com/repos/tigrisdata/tigrisfs/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4) && \
-  curl -L "https://github.com/tigrisdata/tigrisfs/releases/download/${VERSION}/tigrisfs_${VERSION#v}_linux_${ARCH}.tar.gz" -o /tmp/tigrisfs.tar.gz && \
+  VERSION=$(curl -fsSL https://api.github.com/repos/tigrisdata/tigrisfs/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4) && \
+  curl -fsSL "https://github.com/tigrisdata/tigrisfs/releases/download/${VERSION}/tigrisfs_${VERSION#v}_linux_${ARCH}.tar.gz" -o /tmp/tigrisfs.tar.gz && \
   tar -xzf /tmp/tigrisfs.tar.gz -C /usr/local/bin/ && \
   rm /tmp/tigrisfs.tar.gz && \
-  chmod +x /usr/local/bin/tigrisfs
+  chmod +x /usr/local/bin/tigrisfs \
+  || echo "[build] tigrisfs install skipped (download unavailable) — R2 mount disabled"
 
 # ─── Application ──────────────────────────────────────────────────────
 WORKDIR /app
@@ -121,7 +130,9 @@ RUN ln -s /app/bin/nusuk.js /app/bin/nusuk \
 ENV PATH="/app/bin:/app/node_modules/.bin:${PATH}"
 
 # ─── Startup script ───────────────────────────────────────────────────
-# Starts SSH, mounts R2 (if configured), then runs the Node.js server.
+# Runs as root to start sshd (needs root for host keys / port 2222) and mount
+# R2 via tigrisfs (needs root for /mnt/r2), then drops to the toque user via
+# `exec gosu toque node ...` for the HTTP server.
 RUN printf '#!/bin/bash\n\
 set -e\n\
 \n\
@@ -130,7 +141,7 @@ echo "[startup] Starting SSH on port 2222…"\n\
 /usr/sbin/sshd\n\
 \n\
 # ─── Mount R2 bucket via tigrisfs (if configured) ─────────────────\n\
-if [ -n "$R2_BUCKET_NAME" ] && [ -n "$R2_ACCOUNT_ID" ]; then\n\
+if [ -n "$R2_BUCKET_NAME" ] && [ -n "$R2_ACCOUNT_ID" ] && [ -x /usr/local/bin/tigrisfs ]; then\n\
   mkdir -p /mnt/r2\n\
   R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"\n\
   echo "[startup] Mounting R2 bucket ${R2_BUCKET_NAME} at /mnt/r2…"\n\
@@ -143,16 +154,20 @@ if [ -n "$R2_BUCKET_NAME" ] && [ -n "$R2_ACCOUNT_ID" ]; then\n\
   echo "[startup] R2 mounted. Contents:"\n\
   ls -lah /mnt/r2 2>/dev/null || echo "[startup] /mnt/r2 empty or not yet ready"\n\
 else\n\
-  echo "[startup] R2 not configured (R2_BUCKET_NAME/R2_ACCOUNT_ID unset) — skipping mount"\n\
+  echo "[startup] R2 mount skipped (not configured or tigrisfs unavailable)"\n\
 fi\n\
 \n\
-# ─── Start the Node.js HTTP server ─────────────────────────────────\n\
+# ─── Start the Node.js HTTP server (drop to toque user) ────────────\n\
 echo "[startup] Starting Toque server on port ${PORT:-8080}…"\n\
-exec node src/server.js\n\
+exec gosu toque node src/server.js\n\
 ' > /app/startup.sh && chmod +x /app/startup.sh
 
 # ─── Runtime ───────────────────────────────────────────────────────────
-USER toque
+# Startup runs as root (needed for sshd + tigrisfs mount); the startup script
+# drops to the toque user via gosu before starting the Node.js server.
+# Install gosu for a clean privilege drop.
+RUN apt-get update && apt-get install -y --no-install-recommends gosu \
+  && rm -rf /var/lib/apt/lists/*
 
 ENV PORT=8080
 ENV NODE_ENV=production

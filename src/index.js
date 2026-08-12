@@ -5,13 +5,17 @@
  * endpoints directly and proxies everything else to the container.
  */
 
-import { Container } from "@cloudflare/containers";
+import { Container, ContainerProxy } from "@cloudflare/containers";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { env } from "cloudflare:workers";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import { jsonResponse } from "./utils.js";
 import { log } from "./log.js";
 import { proxyToAuthaWorker, proxyToAppWorker, proxyToMcpServer, proxyToUiWorker } from "./proxy.js";
+
+// Re-export ContainerProxy so the runtime can wire up outbound interception
+// for the container (required by @cloudflare/containers).
+export { ContainerProxy };
 
 export class ToqueContainer extends Container {
   defaultPort = 8080;

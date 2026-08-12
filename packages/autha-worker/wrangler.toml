@@ -1,0 +1,16 @@
+name = "autha-worker"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# D1 binding for token/record storage
+[[d1_databases]]
+binding = "AUTHA_DB"
+database_name = "autha-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# Secrets (set via `wrangler secret put`):
+#   AUTHA_API_TOKEN       — Bearer token for API auth
+#   AUTHA_SIGNING_SECRET  — HMAC secret for signed uploads
+
+[vars]
+AUTHA_CAPTCHA_TTL_SECONDS = "120"

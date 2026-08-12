@@ -59,11 +59,13 @@
   "containers": [
     {
       "class_name": "ToqueContainer",
-      "image": "registry.cloudflare.com/3943d4ec18c5391fbbe9158a5d629b55/toque:bc81da5",
+      "image": "registry.cloudflare.com/3943d4ec18c5391fbbe9158a5d629b55/toque:12ca9b9",
       "instance_type": "standard-4",
       "max_instances": 3,
       "constraints": {
-        "regions": ["WNAM"]
+        "regions": [
+          "WNAM"
+        ]
       },
       "ssh": {
         "enabled": true
