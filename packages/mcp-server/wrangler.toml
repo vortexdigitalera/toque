@@ -1,0 +1,27 @@
+name = "toque-mcp-server"
+main = "src/index.js"
+compatibility_date = "2026-08-08"
+compatibility_flags = ["nodejs_compat"]
+
+# Service bindings — mesh to the other workers
+[[services]]
+binding = "AUTHA_WORKER"
+service = "autha-worker"
+
+[[services]]
+binding = "APP_WORKER"
+service = "app-worker"
+
+[[services]]
+binding = "TOQUE_WORKER"
+service = "toque"
+
+# Secrets (set via `wrangler secret put`):
+#   MCP_API_TOKEN       — Bearer token for MCP client auth
+#   AUTHA_API_TOKEN     — Forwarded to autha-worker
+#   APP_API_TOKEN       — Forwarded to app-worker (API mode)
+#   WORKER_API_TOKEN    — Forwarded to toque Worker
+#   CF_ACCESS_TEAM_DOMAIN — If set, CF Access JWT auth is enabled
+
+[observability]
+enabled = true

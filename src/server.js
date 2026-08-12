@@ -337,14 +337,23 @@ async function handleAutoLogin(body = {}) {
     // Save the JWT token if login succeeded
     // The login response has two paths:
     //   - trustedDevice=true:  response.data.authInfo.{token,userToken,refreshToken,permsToken}
-    //   - trustedDevice=false: response.data.token (temp), authInfo=null, OTP required
+    //     → userToken is the AUTH_TOKEN (type 3) with entity claims — save it.
+    //   - trustedDevice=false: response.data.token is a TEMP_TOKEN (type 2),
+    //     authInfo is null, OTP is required.
+    //     → Do NOT save the temp token as userToken — it lacks entity claims
+    //       and will cause all authenticated requests to fail. Only return it
+    //       as intermediateToken for the verify-login step.
     const authInfo = res.json?.response?.data?.authInfo;
     const trustedDevice = res.json?.response?.data?.trustedDevice;
-    const token = authInfo?.userToken || authInfo?.token || res.json?.response?.data?.token;
-    const otpRequired = res.json?.response?.data?.otpType !== undefined && authInfo === null;
     const intermediateToken = res.json?.response?.data?.token;
     const transactionId = res.json?.response?.data?.transactionId;
-
+    // Use tokenType from the JWT to reliably detect temp tokens (type 2)
+    // instead of the fragile `otpType !== undefined && authInfo === null` check.
+    const intermediateJwt = intermediateToken ? parseJwt(intermediateToken) : null;
+    const isTempToken = intermediateJwt?.payload?.tokenType === 2;
+    const otpRequired = trustedDevice === false || isTempToken || (authInfo === null && transactionId !== undefined);
+    // Only save the AUTH_TOKEN (type 3) — never the temp token
+    const token = authInfo?.userToken || authInfo?.token;
     if (token) {
       const authPath = process.env.AUTH_PATH || "auth.json";
       const existing = readJsonIfExists(authPath, {});

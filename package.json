@@ -1,13 +1,16 @@
 {
-  "name": "nusuk-request-handler",
+  "name": "toque",
   "version": "1.0.0",
   "type": "module",
-  "description": "Authenticated Nusuk API request CLI and Node.js client",
+  "description": "Toque — monorepo for the Nusuk request handler platform (Worker + Container + UI + extension)",
   "engines": {
     "node": ">=20"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "test": "node --test",
+    "test": "node --test test/*.test.js packages/*/test/*.test.js",
     "check": "node --check bin/nusuk.js && node --check src/*.js && node --check reqTook.js && node --check senReq.js",
     "container": "node src/server.js",
     "dev": "next dev",
@@ -21,7 +24,9 @@
     "containers:list": "npx wrangler containers list",
     "containers:images": "npx wrangler containers images list",
     "containers:ssh": "npx wrangler containers ssh",
-    "setup:auth": "./scripts/setup-access-oauth.sh"
+    "setup:auth": "./scripts/setup-access-oauth.sh",
+    "test:all": "node --test test/*.test.js packages/*/test/*.test.js",
+    "check:all": "node --check bin/nusuk.js && node --check src/*.js && node --check reqTook.js && node --check senReq.js && node --check packages/autha-worker/src/*.js && node --check packages/app-worker/src/*.js && node --check packages/mcp-server/src/*.js"
   },
   "bin": {
     "nusuk": "./bin/nusuk.js"
@@ -30,14 +35,10 @@
     ".": "./src/nusuk.js"
   },
   "dependencies": {
-    "@base-ui/react": "^1.7.0",
-    "@captcha-libs/capsolver": "^2.2.0",
     "@cloudflare/containers": "^0.3.7",
     "@tailwindcss/postcss": "^4.3.3",
     "@zennolab_com/capmonstercloud-client": "^2.8.0",
-    "class-variance-authority": "^0.7.1",
-    "cloakbrowser": "^0.5.6",
-    "clsx": "^2.1.1",
+    "cloakbrowser": "^0.5.7",
     "dotenv": "^17.2.3",
     "jose": "^6.2.8",
     "lucide-react": "^1.31.0",

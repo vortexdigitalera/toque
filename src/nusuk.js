@@ -59,6 +59,16 @@ export class Nusuk {
     // (login response has authInfo.entityId=null, but the AUTH_TOKEN JWT
     // carries defaultEntityId/defaultEntityTypeId/entities)
     const jwt = parseJwt(token);
+    // Validate token type — only AUTH_TOKEN (type 3) has entity claims.
+    // TEMP_TOKEN (2) and USER_TOKEN (5) lack entity claims and will cause
+    // authenticated requests to fail. Warn the user to run verify-login.
+    if (jwt?.payload?.tokenType && jwt.payload.tokenType !== 3) {
+      const tokenTypeMap = { 2: "TEMP", 4: "REFRESH", 5: "USER" };
+      const label = tokenTypeMap[jwt.payload.tokenType] || jwt.payload.tokenType;
+      throw new Error(
+        `auth token is a ${label}_TOKEN (type ${jwt.payload.tokenType}), not an AUTH_TOKEN (type 3) — run \`nusuk verify-login\` to get the full auth token with entity claims`
+      );
+    }
     const entityId = authInfo?.entityId || jwt?.payload?.defaultEntityId || jwt?.payload?.entities?.[0]?.entityId;
     const entityTypeId = authInfo?.entityTypeId || jwt?.payload?.defaultEntityTypeId || jwt?.payload?.entities?.[0]?.entityTypeId;
     if (entityId) {

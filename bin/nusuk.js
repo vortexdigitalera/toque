@@ -167,9 +167,16 @@ function injectCaptchaToken(payload, captchaToken) {
 
 function writeAuthToken(token, entityId) {
   const authPath = process.env.AUTH_PATH || "auth.json";
-  const data = { response: { data: { authInfo: { userToken: token } } } };
-  if (entityId) data.entityId = String(entityId);
-  writePrivateJson(authPath, data);
+  // Merge with existing auth.json instead of overwriting it — preserves
+  // refreshToken, permsToken, and entityId from previous logins.
+  let existing = {};
+  try { existing = JSON.parse(readFileSync(authPath, "utf8")); } catch { /* ignore */ }
+  existing.response = existing.response || { data: { authInfo: {} } };
+  existing.response.data = existing.response.data || { authInfo: {} };
+  existing.response.data.authInfo = existing.response.data.authInfo || {};
+  existing.response.data.authInfo.userToken = token;
+  if (entityId) existing.response.data.authInfo.entityId = String(entityId);
+  writePrivateJson(authPath, existing);
 }
 
 function ensureInitFiles() {
@@ -490,7 +497,24 @@ function saveContext(context, { type = "visa", worker, quiet = false } = {}) {
   const entityPath = process.env.ENTITY_CONFIG_PATH || "entity.json";
 
   if (token) {
+    // Save refreshToken and permsToken from the D1 context too, so
+    // `nusuk refresh-token` works after a pull-based login (not just
+    // after a full browser login-auto).
+    const auth = context.auth || {};
+    const refreshToken = auth.refreshToken || auth.token?.refreshToken;
+    const permsToken = auth.permsToken || auth.token?.permsToken;
     writeAuthToken(token, entityId);
+    if (refreshToken || permsToken) {
+      const authPath = process.env.AUTH_PATH || "auth.json";
+      let existing = {};
+      try { existing = JSON.parse(readFileSync(authPath, "utf8")); } catch { /* ignore */ }
+      existing.response = existing.response || { data: { authInfo: {} } };
+      existing.response.data = existing.response.data || { authInfo: {} };
+      existing.response.data.authInfo = existing.response.data.authInfo || {};
+      if (refreshToken) existing.response.data.authInfo.refreshToken = refreshToken;
+      if (permsToken) existing.response.data.authInfo.permsToken = permsToken;
+      writePrivateJson(authPath, existing);
+    }
   }
   if (captcha) {
     const existingCaptcha = existsSync(captchaPath)
@@ -690,10 +714,23 @@ async function cmdAutoLogin(args) {
     // Step 4: Save the JWT token if login succeeded
     // The login response has two paths:
     //   - trustedDevice=true:  response.data.authInfo.{token,userToken,refreshToken,permsToken}
-    //   - trustedDevice=false: response.data.token (temp), authInfo=null, OTP required
+    //     → userToken is the AUTH_TOKEN (type 3) with entity claims — save it.
+    //   - trustedDevice=false: response.data.token is a TEMP_TOKEN (type 2),
+    //     authInfo is null, OTP is required.
+    //     → Do NOT save the temp token as userToken — it lacks entity claims
+    //       and will cause all authenticated requests to fail. Only save it
+    //       as intermediateToken for the verify-login step.
     const authInfo = res.json?.response?.data?.authInfo;
     const trustedDevice = res.json?.response?.data?.trustedDevice;
-    const token = authInfo?.userToken || authInfo?.token || res.json?.response?.data?.token;
+    const intermediateToken = res.json?.response?.data?.token;
+    const transactionId = res.json?.response?.data?.transactionId;
+    // Use tokenType from the JWT to reliably detect temp tokens (type 2)
+    // instead of the fragile `otpType !== undefined && authInfo === null` check.
+    const intermediateJwt = intermediateToken ? parseJwt(intermediateToken) : null;
+    const isTempToken = intermediateJwt?.payload?.tokenType === 2;
+    const otpRequired = trustedDevice === false || isTempToken || (authInfo === null && transactionId !== undefined);
+    // Only save the AUTH_TOKEN (type 3) — never the temp token
+    const token = authInfo?.userToken || authInfo?.token;
     if (token) {
       const authPath = process.env.AUTH_PATH || "auth.json";
       let existing = {};
@@ -715,7 +752,11 @@ async function cmdAutoLogin(args) {
       writePrivateJson(authPath, existing);
       console.log(`  auth     : valid JWT saved to ${authPath}`);
       if (entityId) console.log(`  entity   : ${entityId}${entityTypeId ? ` (type ${entityTypeId})` : ""}`);
-      if (trustedDevice === false) console.log(`  otp      : required (use verify-login with transaction ID)`);
+    } else if (otpRequired) {
+      // trustedDevice=false: don't save the temp token to auth.json.
+      // Store it as intermediateToken in profile.json for verify-login.
+      console.log(`  auth     : OTP required (temp token not saved to auth.json)`);
+      console.log(`  otp      : required — run \`nusuk verify-login --transaction-id ${transactionId} --otp <code>\``);
     } else {
       console.log(`  auth     : no token in response`);
       process.exitCode = 1;
@@ -764,13 +805,22 @@ async function cmdVerifyLogin(args) {
   console.log(`  transaction : ${transactionId}`);
   console.log(`  otp code    : ${otpCode}`);
 
+  // Load the AES key from profile.json (saved by login-auto) so the
+  // otpTimeStamp uses the same key as the original login request.
+  let aesKey;
+  try {
+    const profilePath = process.env.PROFILE_PATH || "profile.json";
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    aesKey = profile.aesKey || undefined;
+  } catch { /* profile doesn't exist — fall back to default key */ }
+
   const { buildOtpTimeStamp } = await import("../src/nusuk-crypto.js");
   const verifyPayload = {
     transactionId,
     system,
     module,
     otpCode,
-    otpTimeStamp: buildOtpTimeStamp(),
+    otpTimeStamp: buildOtpTimeStamp(aesKey),
   };
 
   const nusuk = new Nusuk({ referer: "https://masar.nusuk.sa/pub/login" });
@@ -1896,6 +1946,194 @@ async function cmdSendVisa(args) {
     await nusuk.close();
   }
 }
+// ─── nusuk config — memorized & configurable options ────────────────
+
+/**
+ * Config file location: ~/.toque/config.json (or TOQUE_CONFIG_PATH).
+ * Stores user preferences that persist across sessions and sync to D1
+ * when the Worker is reachable.
+ *
+ * Supported keys mirror packages/shared/src/config.ts — a flat dotted
+ * path like "captcha.provider" or "nusuk.activeEntityId".
+ */
+function configFilePath() {
+  return process.env.TOQUE_CONFIG_PATH ||
+    resolve(process.env.HOME || process.env.USERPROFILE || ".", ".toque", "config.json");
+}
+
+/** Known config keys with their default values (mirrors DEFAULT_CONFIG). */
+const CONFIG_KEYS = {
+  "autha.endpoint": "https://autha-worker.decloud.workers.dev",
+  "autha.apiToken": "",
+  "autha.proxyMode": false,
+  "worker.url": "https://toque.decloud.workers.dev",
+  "worker.apiKey": "",
+  "worker.jwt": "",
+  "worker.authMode": "api-key",
+  "nusuk.baseUrl": "https://masar.nusuk.sa",
+  "nusuk.activeEntityId": "",
+  "nusuk.activeEntityTypeId": "",
+  "nusuk.systemUserId": "default",
+  "captcha.provider": "capsolver",
+  "captcha.capmonsterApiKey": "",
+  "captcha.capsolverApiKey": "",
+  "captcha.siteKey": "6Le-3OwpAAAAAARztuPscqBNbpEY3okMkd7dCoyx",
+  "captcha.pageUrl": "https://masar.nusuk.sa/umrah/mutamer-group/group-list",
+  "captcha.pageAction": "submit",
+  "captcha.minScore": 0.7,
+  "container.maxInstances": 3,
+  "container.sleepAfter": "60m",
+  "container.instanceType": "standard-4",
+  "container.regions": ["WEUR"],
+  "paths.auth": "auth.json",
+  "paths.captcha": "captcha.json",
+  "paths.entity": "entity.json",
+  "paths.profile": "profile.json",
+};
+
+/** Coerce a string CLI value into the right type for a key. */
+function coerceConfigValue(key, raw) {
+  const def = CONFIG_KEYS[key];
+  if (def === undefined) throw new Error(`Unknown config key: "${key}". Run "nusuk config list" for valid keys.`);
+  if (typeof def === "boolean") {
+    const v = String(raw).toLowerCase();
+    if (["true", "1", "yes", "on"].includes(v)) return true;
+    if (["false", "0", "no", "off"].includes(v)) return false;
+    throw new Error(`"${key}" expects a boolean (true/false), got "${raw}"`);
+  }
+  if (typeof def === "number") {
+    const n = Number(raw);
+    if (Number.isNaN(n)) throw new Error(`"${key}" expects a number, got "${raw}"`);
+    return n;
+  }
+  if (Array.isArray(def)) {
+    // comma-separated → array
+    return String(raw).split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return String(raw);
+}
+
+function loadConfigFile() {
+  const path = configFilePath();
+  try {
+    return JSON.parse(readFileSync(path, "utf8") || "{}");
+  } catch (err) {
+    if (err.code === "ENOENT") return {};
+    throw err;
+  }
+}
+
+function saveConfigFile(config) {
+  const path = configFilePath();
+  writePrivateJson(path, config);
+}
+
+async function cmdConfig(args) {
+  const sub = args[0];
+  if (!sub || ["help", "--help", "-h"].includes(sub)) {
+    console.log(`
+Usage: nusuk config <command> [options]
+
+Commands:
+  list                  Show all config keys and current values
+  get <key>             Show the value of one key
+  set <key> <value>     Set a key (persists to ~/.toque/config.json)
+  unset <key>           Remove a key (reverts to default)
+  path                  Show the config file location
+  sync                  Push local config to the Worker's D1 settings store
+
+Keys are dotted paths, e.g. "captcha.provider" or "nusuk.activeEntityId".
+Run "nusuk config list" to see all valid keys.
+`);
+    return;
+  }
+
+  switch (sub) {
+    case "list": {
+      const local = loadConfigFile();
+      console.log("\nToque configuration\n");
+      const maxKeyLen = Math.max(...Object.keys(CONFIG_KEYS).map((k) => k.length));
+      for (const [key, def] of Object.entries(CONFIG_KEYS)) {
+        const value = key in local ? local[key] : def;
+        const source = key in local ? "local" : "default";
+        const display = Array.isArray(value) ? `[${value.join(", ")}]` :
+          typeof value === "string" && value === "" ? "(empty)" : value;
+        console.log(`  ${key.padEnd(maxKeyLen)}  ${String(display).padEnd(30)}  [${source}]`);
+      }
+      console.log(`\nConfig file: ${configFilePath()}`);
+      break;
+    }
+    case "get": {
+      const key = args[1];
+      if (!key) throw new Error("Usage: nusuk config get <key>");
+      if (!(key in CONFIG_KEYS)) throw new Error(`Unknown key: "${key}". Run "nusuk config list".`);
+      const local = loadConfigFile();
+      const value = key in local ? local[key] : CONFIG_KEYS[key];
+      console.log(typeof value === "object" ? JSON.stringify(value) : value);
+      break;
+    }
+    case "set": {
+      const key = args[1];
+      const value = args[2];
+      if (!key || value === undefined) throw new Error("Usage: nusuk config set <key> <value>");
+      const coerced = coerceConfigValue(key, value);
+      const local = loadConfigFile();
+      local[key] = coerced;
+      saveConfigFile(local);
+      console.log(`✓ ${key} = ${Array.isArray(coerced) ? `[${coerced.join(", ")}]` : coerced}`);
+      console.log(`  saved to ${configFilePath()}`);
+      break;
+    }
+    case "unset": {
+      const key = args[1];
+      if (!key) throw new Error("Usage: nusuk config unset <key>");
+      if (!(key in CONFIG_KEYS)) throw new Error(`Unknown key: "${key}". Run "nusuk config list".`);
+      const local = loadConfigFile();
+      if (key in local) {
+        delete local[key];
+        saveConfigFile(local);
+        console.log(`✓ ${key} unset (reverted to default: ${CONFIG_KEYS[key]})`);
+      } else {
+        console.log(`${key} is not set locally (already using default)`);
+      }
+      break;
+    }
+    case "path": {
+      console.log(configFilePath());
+      break;
+    }
+    case "sync": {
+      await cmdConfigSync();
+      break;
+    }
+    default:
+      throw new Error(`Unknown config command: "${sub}". Run "nusuk config help".`);
+  }
+}
+
+/** Push local config to the Worker's D1 settings store (best-effort). */
+async function cmdConfigSync() {
+  const local = loadConfigFile();
+  const keys = Object.keys(local);
+  if (keys.length === 0) {
+    console.log("No local config to sync. Use 'nusuk config set' first.");
+    return;
+  }
+  const workerUrl = local["worker.url"] || CONFIG_KEYS["worker.url"];
+  const apiKey = local["worker.apiKey"] || process.env.WORKER_API_KEY || "";
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
+  const res = await fetch(`${workerUrl}/api/settings`, {
+    method: "PUT",
+    headers,
+    body: JSON.stringify({ settings: local }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Sync failed (${res.status}): ${body.slice(0, 200)}`);
+  }
+  console.log(`✓ synced ${keys.length} setting(s) to ${workerUrl}`);
+}
 function help(topic = "") {
   if (topic === "captcha") {
     console.log(`
@@ -1946,6 +2184,7 @@ Common tasks:
   groups list           Show group names and IDs
   schedule              Schedule a request
   workflow              Manage Cloudflare Workflow instances (status, terminate)
+  config                Memorized & configurable options (get, set, list, sync)
   sync-time             Sync system clock to accurate network time
   bench [count]         Measure request latency
 
@@ -2102,6 +2341,9 @@ async function main() {
       break;
     case "workflow":
       await cmdWorkflow(args);
+      break;
+    case "config":
+      await cmdConfig(args);
       break;
     case "help":
       help(args[0] || "");

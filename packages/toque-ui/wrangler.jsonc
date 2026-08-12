@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "toque-ui",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-08",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  "services": [
+    {
+      "binding": "TOQUE_WORKER",
+      "service": "toque"
+    }
+  ],
+
+  "vars": {
+    "TOQUE_WORKER_URL": "https://toque.decloud.workers.dev"
+  },
+
+  "observability": {
+    "enabled": true,
+    "logs": { "invocation_logs": true, "head_sampling_rate": 1 }
+  },
+
+  "placement": { "mode": "smart" }
+}

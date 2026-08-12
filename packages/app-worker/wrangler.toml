@@ -1,0 +1,29 @@
+name = "app-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-08"
+compatibility_flags = ["nodejs_compat"]
+
+# D1 binding — the app database (users, audit_logs, settings, sessions)
+[[d1_databases]]
+binding = "APP_DB"
+database_name = "app_db"
+database_id = "3b463de4-b1ff-46da-8b85-922f82cb8dbc"
+
+# Durable Object for real-time audit log broadcasting
+[durable_objects]
+bindings = [
+  { name = "AUDIT_BROADCASTER", class_name = "AuditLogBroadcaster" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AuditLogBroadcaster"]
+
+# Secrets (set via `wrangler secret put`):
+#   APP_API_TOKEN — Bearer token for API auth (fallback when CF Access is unavailable)
+#   CF_ACCESS_TEAM_DOMAIN — Cloudflare Access team domain (e.g. "toque.cloudflareaccess.com")
+#   CF_ACCESS_AUD — JWT audience claim for verification
+#   ADMIN_EMAIL — First user with this email gets super_admin role
+
+[observability]
+enabled = true

@@ -107,10 +107,11 @@ do_build_and_push() {
   local full_tag="${IMAGE_NAME}:${TAG}"
   log "Building and pushing image: $full_tag"
 
-  # wrangler containers build -p builds locally and pushes to Cloudflare registry
-  # The -t flag takes "name:tag" — the name becomes the registry repo name.
-  # Output: registry.cloudflare.com/<ACCOUNT_ID>/<NAME>:<TAG>
-  npx wrangler containers build -p -t "$full_tag" . 2>&1 | tee /dev/stderr
+  # Build from Dockerfile (Node.js 26 slim + headless browser deps for
+  # CloakBrowser). wrangler containers build doesn't support --dockerfile,
+  # so we use docker build directly with -f, then push to Cloudflare's
+  # managed registry.
+  docker build -f Dockerfile -t "$full_tag" . 2>&1 | tee /dev/stderr
 
   local account_id
   account_id=$(npx wrangler whoami 2>/dev/null | grep -oE '[a-f0-9]{32}' | head -1)
@@ -119,6 +120,15 @@ do_build_and_push() {
   if [ -z "$account_id" ]; then
     die "Could not determine account ID. Check the build log above."
   fi
+
+  # Authenticate to the Cloudflare registry (temporary token, valid ~15 min)
+  local registry_token
+  registry_token=$(npx wrangler containers registries credentials registry.cloudflare.com --push 2>/dev/null | tail -1)
+  echo "$registry_token" | docker login registry.cloudflare.com -u v1 --password-stdin 2>&1 | tee /dev/stderr
+
+  # Tag for the Cloudflare registry and push
+  docker tag "$full_tag" "$registry_uri" 2>&1 | tee /dev/stderr
+  docker push "$registry_uri" 2>&1 | tee /dev/stderr
 
   ok "Image pushed to: $registry_uri"
   echo "$registry_uri" > "$PROJECT_ROOT/.last-image"

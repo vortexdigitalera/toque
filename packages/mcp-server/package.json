@@ -1,0 +1,11 @@
+{
+  "name": "@toque/mcp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server exposing the toque platform (autha-worker, app-worker, toque Worker) as tools for AI agents.",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}

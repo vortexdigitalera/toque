@@ -1,6 +1,12 @@
 /**
- * CapSolver — uses the official @captcha-libs/capsolver SDK for fast,
- * concurrent captcha solving on the Masar Nusuk platform.
+ * CapSolver — direct REST API client for fast, concurrent captcha solving
+ * on the Masar Nusuk platform.
+ *
+ * This module talks to the CapSolver REST API directly (createTask →
+ * getTaskResult polling → getBalance) using the global `fetch` available in
+ * Node 20+. It replaces the deprecated `@captcha-libs/capsolver` SDK, whose
+ * dependency tree pulled in the unmaintained `@captcha-libs/captcha-client`
+ * and `node-domexception` packages (both emit npm deprecation warnings).
  *
  * Supports:
  *   - reCAPTCHA v2 (ReCaptchaV2TaskProxyLess)
@@ -8,9 +14,6 @@
  *   - reCAPTCHA v3 (ReCaptchaV3TaskProxyLess)
  *   - reCAPTCHA v3 Enterprise (ReCaptchaV3EnterpriseTaskProxyLess)
  *   - Cloudflare Turnstile (AntiTurnstileTaskProxyLess)
- *
- * The SDK handles task creation, polling, and result retrieval internally,
- * eliminating the manual polling loop from the previous REST API approach.
  *
  * Usage:
  *   const solver = new CapSolver();
@@ -22,21 +25,14 @@
  *   CAPSOLVER_PAGE_URL   — page URL where the captcha appears
  *   CAPSOLVER_PAGE_ACTION — page action for reCAPTCHA v3 (default: "submit")
  *   CAPSOLVER_MIN_SCORE  — minimum score for v3 (default: 0.7)
+ *   CAPSOLVER_API_URL    — API base URL (default: https://api.capsolver.com)
  */
-
-import {
-  CapSolver as CapSolverClient,
-  ReCaptchaV2TaskProxyLess,
-  ReCaptchaV2EnterpriseTaskProxyLess,
-  ReCaptchaV3TaskProxyLess,
-  ReCaptchaV3EnterpriseTaskProxyLess,
-  AntiTurnstileTaskProxyLess,
-} from "@captcha-libs/capsolver";
 
 const DEFAULT_SITE_KEY = "6Le-3OwpAAAAAARztuPscqBNbpEY3okMkd7dCoyx";
 const DEFAULT_PAGE_URL = "https://masar.nusuk.sa/umrah/mutamer-group/group-list";
 const DEFAULT_PAGE_ACTION = "submit";
 const DEFAULT_MIN_SCORE = 0.7;
+const DEFAULT_API_URL = "https://api.capsolver.com";
 
 export class CapSolver {
   /**
@@ -48,6 +44,7 @@ export class CapSolver {
    * @param {number} [config.minScore] — Minimum score for v3 (0.1–0.9).
    * @param {number} [config.pollingInterval] — Poll interval in ms (default: 2000).
    * @param {number} [config.timeout] — Solve timeout in ms (default: 180000).
+   * @param {string} [config.apiUrl] — CapSolver API base URL.
    */
   constructor(config = {}) {
     this.clientKey = config.clientKey || process.env.CAPSOLVER_API_KEY || null;
@@ -57,7 +54,7 @@ export class CapSolver {
     this.minScore = config.minScore ?? (process.env.CAPSOLVER_MIN_SCORE ? Number(process.env.CAPSOLVER_MIN_SCORE) : DEFAULT_MIN_SCORE);
     this.pollingInterval = config.pollingInterval ?? 2000;
     this.timeout = config.timeout ?? 180000;
-    this._client = null;
+    this.apiUrl = (config.apiUrl || process.env.CAPSOLVER_API_URL || DEFAULT_API_URL).replace(/\/$/, "");
   }
 
   _assertKey() {
@@ -67,19 +64,56 @@ export class CapSolver {
   }
 
   /**
-   * Lazily create the CapSolver SDK client singleton.
-   * @returns {CapSolverClient}
+   * POST a JSON body to a CapSolver endpoint and return the parsed response.
+   * Throws on network errors or non-zero errorId.
+   * @param {string} path — Endpoint path (e.g. "/createTask").
+   * @param {object} body — Request body (clientKey is injected automatically).
+   * @returns {Promise<object>} Parsed JSON response.
    */
-  getClient() {
+  async _post(path, body) {
     this._assertKey();
-    if (!this._client) {
-      this._client = new CapSolverClient({
-        clientKey: this.clientKey,
-        pollingInterval: this.pollingInterval,
-        timeout: this.timeout,
-      });
+    const url = `${this.apiUrl}${path}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientKey: this.clientKey, ...body }),
+    });
+    if (!resp.ok) {
+      throw new Error(`CapSolver ${path} HTTP ${resp.status}: ${await resp.text().catch(() => "")}`);
     }
-    return this._client;
+    const data = await resp.json();
+    if (data.errorId && data.errorId !== 0) {
+      const msg = data.errorDescription || data.errorCode || `CapSolver error ${data.errorId}`;
+      throw new Error(`CapSolver ${path} failed: ${msg}`);
+    }
+    return data;
+  }
+
+  /**
+   * Create a task and poll getTaskResult until ready or timeout.
+   * @param {object} task — Task payload (type, websiteURL, websiteKey, ...).
+   * @param {number} [timeout] — Solve timeout in ms (default: this.timeout).
+   * @returns {Promise<object>} solution object from getTaskResult.
+   */
+  async _solveTask(task, timeout) {
+    const deadline = Date.now() + (timeout ?? this.timeout);
+    const { taskId } = await this._post("/createTask", { task });
+    if (!taskId) {
+      throw new Error("CapSolver createTask returned no taskId");
+    }
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, this.pollingInterval));
+      const result = await this._post("/getTaskResult", { taskId });
+      if (result.status === "ready") {
+        return result.solution || {};
+      }
+      if (result.status === "failed") {
+        throw new Error(`CapSolver task ${taskId} failed`);
+      }
+      // status === "processing" → keep polling
+    }
+    throw new Error(`CapSolver task ${taskId} timed out after ${timeout ?? this.timeout}ms`);
   }
 
   /**
@@ -87,8 +121,7 @@ export class CapSolver {
    * @returns {Promise<{balance: number}>} Balance info.
    */
   async getBalance() {
-    const client = this.getClient();
-    const result = await client.getBalance();
+    const result = await this._post("/getBalance", {});
     return { balance: result.balance };
   }
 
@@ -103,14 +136,16 @@ export class CapSolver {
    * @returns {Promise<string>} gRecaptchaResponse token.
    */
   async solveRecaptchaV2(options = {}) {
-    const client = this.getClient();
-    const task = new ReCaptchaV2TaskProxyLess({
-      websiteURL: options.websiteURL || this.pageUrl,
-      websiteKey: options.websiteKey || this.siteKey,
-      isInvisible: options.isInvisible || false,
-    });
-    const result = await client.solve(task);
-    const token = result.solution?.gRecaptchaResponse;
+    const solution = await this._solveTask(
+      {
+        type: "ReCaptchaV2TaskProxyLess",
+        websiteURL: options.websiteURL || this.pageUrl,
+        websiteKey: options.websiteKey || this.siteKey,
+        isInvisible: options.isInvisible || false,
+      },
+      options.timeout
+    );
+    const token = solution?.gRecaptchaResponse;
     if (!token) {
       throw new Error("CapSolver returned no gRecaptchaResponse for reCAPTCHA v2");
     }
@@ -123,14 +158,16 @@ export class CapSolver {
    * @returns {Promise<string>} gRecaptchaResponse token.
    */
   async solveRecaptchaV2Enterprise(options = {}) {
-    const client = this.getClient();
-    const task = new ReCaptchaV2EnterpriseTaskProxyLess({
-      websiteURL: options.websiteURL || this.pageUrl,
-      websiteKey: options.websiteKey || this.siteKey,
-      isInvisible: options.isInvisible || false,
-    });
-    const result = await client.solve(task);
-    const token = result.solution?.gRecaptchaResponse;
+    const solution = await this._solveTask(
+      {
+        type: "ReCaptchaV2EnterpriseTaskProxyLess",
+        websiteURL: options.websiteURL || this.pageUrl,
+        websiteKey: options.websiteKey || this.siteKey,
+        isInvisible: options.isInvisible || false,
+      },
+      options.timeout
+    );
+    const token = solution?.gRecaptchaResponse;
     if (!token) {
       throw new Error("CapSolver returned no gRecaptchaResponse for reCAPTCHA v2 Enterprise");
     }
@@ -149,15 +186,17 @@ export class CapSolver {
    * @returns {Promise<string>} gRecaptchaResponse token.
    */
   async solveRecaptchaV3(options = {}) {
-    const client = this.getClient();
-    const task = new ReCaptchaV3TaskProxyLess({
-      websiteURL: options.websiteURL || this.pageUrl,
-      websiteKey: options.websiteKey || this.siteKey,
-      pageAction: options.pageAction || this.pageAction,
-      minScore: options.minScore ?? this.minScore,
-    });
-    const result = await client.solve(task);
-    const token = result.solution?.gRecaptchaResponse;
+    const solution = await this._solveTask(
+      {
+        type: "ReCaptchaV3TaskProxyLess",
+        websiteURL: options.websiteURL || this.pageUrl,
+        websiteKey: options.websiteKey || this.siteKey,
+        pageAction: options.pageAction || this.pageAction,
+        minScore: options.minScore ?? this.minScore,
+      },
+      options.timeout
+    );
+    const token = solution?.gRecaptchaResponse;
     if (!token) {
       throw new Error("CapSolver returned no gRecaptchaResponse for reCAPTCHA v3");
     }
@@ -170,15 +209,17 @@ export class CapSolver {
    * @returns {Promise<string>} gRecaptchaResponse token.
    */
   async solveRecaptchaV3Enterprise(options = {}) {
-    const client = this.getClient();
-    const task = new ReCaptchaV3EnterpriseTaskProxyLess({
-      websiteURL: options.websiteURL || this.pageUrl,
-      websiteKey: options.websiteKey || this.siteKey,
-      pageAction: options.pageAction || this.pageAction,
-      minScore: options.minScore ?? this.minScore,
-    });
-    const result = await client.solve(task);
-    const token = result.solution?.gRecaptchaResponse;
+    const solution = await this._solveTask(
+      {
+        type: "ReCaptchaV3EnterpriseTaskProxyLess",
+        websiteURL: options.websiteURL || this.pageUrl,
+        websiteKey: options.websiteKey || this.siteKey,
+        pageAction: options.pageAction || this.pageAction,
+        minScore: options.minScore ?? this.minScore,
+      },
+      options.timeout
+    );
+    const token = solution?.gRecaptchaResponse;
     if (!token) {
       throw new Error("CapSolver returned no gRecaptchaResponse for reCAPTCHA v3 Enterprise");
     }
@@ -195,13 +236,15 @@ export class CapSolver {
    * @returns {Promise<string>} Turnstile token.
    */
   async solveTurnstile(options = {}) {
-    const client = this.getClient();
-    const task = new AntiTurnstileTaskProxyLess({
-      websiteURL: options.websiteURL || this.pageUrl,
-      websiteKey: options.websiteKey || this.siteKey,
-    });
-    const result = await client.solve(task);
-    const token = result.solution?.token || result.solution?.gRecaptchaResponse;
+    const solution = await this._solveTask(
+      {
+        type: "AntiTurnstileTaskProxyLess",
+        websiteURL: options.websiteURL || this.pageUrl,
+        websiteKey: options.websiteKey || this.siteKey,
+      },
+      options.timeout
+    );
+    const token = solution?.token || solution?.gRecaptchaResponse;
     if (!token) {
       throw new Error("CapSolver returned no token for Turnstile");
     }

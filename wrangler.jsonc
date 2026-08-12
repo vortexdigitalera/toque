@@ -26,6 +26,30 @@
     {
       "binding": "AUTHA_WORKER",
       "service": "autha-worker"
+    },
+    {
+      "binding": "APP_WORKER",
+      "service": "app-worker"
+    },
+    {
+      "binding": "MCP_SERVER",
+      "service": "toque-mcp-server"
+    },
+    {
+      "binding": "TOQUE_UI",
+      "service": "toque-ui"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "AUTHA_DB",
+      "database_name": "autha_db",
+      "database_id": "15ee205b-5083-42dd-a464-505dc8fd566f"
+    },
+    {
+      "binding": "APP_DB",
+      "database_name": "app_db",
+      "database_id": "3b463de4-b1ff-46da-8b85-922f82cb8dbc"
     }
   ],
   "placement": {
@@ -35,12 +59,12 @@
   "containers": [
     {
       "class_name": "ToqueContainer",
-      "image": "registry.cloudflare.com/3943d4ec18c5391fbbe9158a5d629b55/toque:d09c11c",
+      "image": "registry.cloudflare.com/3943d4ec18c5391fbbe9158a5d629b55/toque:3199398",
       "instance_type": "standard-4",
-      "max_instances": 1,
+      "max_instances": 3,
       "constraints": {
         "regions": [
-          "WEUR"
+          "WNAM"
         ]
       },
       "ssh": {

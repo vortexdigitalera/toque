@@ -5,12 +5,17 @@
  * endpoints directly and proxies everything else to the container.
  */
 
-import { Container } from "@cloudflare/containers";
+import { Container, ContainerProxy } from "@cloudflare/containers";
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import { env } from "cloudflare:workers";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import { jsonResponse } from "./utils.js";
 import { log } from "./log.js";
+import { proxyToAuthaWorker, proxyToAppWorker, proxyToMcpServer, proxyToUiWorker } from "./proxy.js";
+
+// Re-export ContainerProxy so the runtime can wire up outbound interception
+// for the container (required by @cloudflare/containers).
+export { ContainerProxy };
 
 export class ToqueContainer extends Container {
   defaultPort = 8080;
@@ -31,12 +36,21 @@ export class ToqueContainer extends Container {
   // instead of calling the autha-worker over the public internet. The Worker
   // injects WORKER_API_TOKEN via the binding, so the container doesn't need
   // to send it. Falls back to WORKER_URL (direct) when unset.
+  //
+  // R2_* vars: when R2_BUCKET_NAME is set, the container's startup script
+  // mounts the R2 bucket at /mnt/r2 via tigrisfs (FUSE). This lets the
+  // container read/write R2 objects as local files without S3 API calls.
   envVars = {
     WORKER_URL: env.WORKER_URL,
     WORKER_API_TOKEN: env.WORKER_API_TOKEN,
     AUTHA_PROXY_URL: env.AUTHA_PROXY_URL || (env.TOQUE_WORKER_URL ? `${env.TOQUE_WORKER_URL}/autha` : ""),
     CAPMONSTER_API_KEY: env.CAPMONSTER_API_KEY,
     CAPSOLVER_API_KEY: env.CAPSOLVER_API_KEY,
+    // R2 FUSE mount (tigrisfs) — all optional; mount is skipped if unset
+    R2_BUCKET_NAME: env.R2_BUCKET_NAME,
+    R2_ACCOUNT_ID: env.R2_ACCOUNT_ID,
+    R2_ACCESS_KEY_ID: env.R2_ACCESS_KEY_ID,
+    R2_SECRET_ACCESS_KEY: env.R2_SECRET_ACCESS_KEY,
   };
 
   onStart() {
@@ -53,6 +67,112 @@ export class ToqueContainer extends Container {
     });
   }
 }
+
+// ---------------------------------------------------------------------------
+// Outbound handlers — let the container access Worker bindings directly
+// ---------------------------------------------------------------------------
+//
+// The container makes plain HTTP requests to virtual hostnames (e.g.
+// http://autha-db/query) and these handlers resolve them using the
+// Worker's bindings (D1, R2, service bindings). No SDK or API token
+// needed inside the container — the Worker runtime handles everything.
+//
+// Available virtual hosts from inside the container:
+//   http://autha-db/*  → AUTHA_DB (D1) — auth/token store
+//   http://app-db/*    → APP_DB (D1) — users, audit logs, settings
+//   http://autha-w/*   → AUTHA_WORKER (service binding) — autha-worker
+//   http://app-w/*     → APP_WORKER (service binding) — app-worker
+//   http://mcp-w/*     → MCP_SERVER (service binding) — MCP server
+//   http://toque-w/*   → this Worker (self-proxy for /health, /help, etc.)
+
+ToqueContainer.outboundByHost = {
+  // ─── D1: autha_db (token store) ───────────────────────────────────
+  "autha-db": async (request, env) => {
+    const url = new URL(request.url);
+    // POST /query → D1 query with JSON body { sql, params? }
+    if (url.pathname === "/query" && request.method === "POST") {
+      const { sql, params = [] } = await request.json();
+      const result = await env.AUTHA_DB.prepare(sql).bind(...params).all();
+      return Response.json(result);
+    }
+    // POST /exec → D1 exec (no results returned)
+    if (url.pathname === "/exec" && request.method === "POST") {
+      const { sql, params = [] } = await request.json();
+      const result = await env.AUTHA_DB.prepare(sql).bind(...params).run();
+      return Response.json(result);
+    }
+    return new Response("not found", { status: 404 });
+  },
+
+  // ─── D1: app_db (users, audit, settings) ──────────────────────────
+  "app-db": async (request, env) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/query" && request.method === "POST") {
+      const { sql, params = [] } = await request.json();
+      const result = await env.APP_DB.prepare(sql).bind(...params).all();
+      return Response.json(result);
+    }
+    if (url.pathname === "/exec" && request.method === "POST") {
+      const { sql, params = [] } = await request.json();
+      const result = await env.APP_DB.prepare(sql).bind(...params).run();
+      return Response.json(result);
+    }
+    return new Response("not found", { status: 404 });
+  },
+
+  // ─── Service binding: autha-worker ────────────────────────────────
+  "autha-w": async (request, env) => {
+    // Forward the request as-is to the autha-worker, injecting the
+    // WORKER_API_TOKEN so the container doesn't need it.
+    const headers = new Headers(request.headers);
+    if (!headers.has("Authorization") && env.WORKER_API_TOKEN) {
+      headers.set("Authorization", `Bearer ${env.WORKER_API_TOKEN}`);
+    }
+    const url = new URL(request.url);
+    const proxyReq = new Request(
+      new URL(url.pathname + url.search, "https://autha-worker.internal"),
+      {
+        method: request.method,
+        headers,
+        body: request.method !== "GET" && request.method !== "HEAD" ? request.body : null,
+        redirect: "manual",
+      },
+    );
+    return env.AUTHA_WORKER.fetch(proxyReq);
+  },
+
+  // ─── Service binding: app-worker ──────────────────────────────────
+  "app-w": async (request, env) => {
+    const headers = new Headers(request.headers);
+    const url = new URL(request.url);
+    const proxyReq = new Request(
+      new URL(url.pathname + url.search, "https://app-worker.internal"),
+      {
+        method: request.method,
+        headers,
+        body: request.method !== "GET" && request.method !== "HEAD" ? request.body : null,
+        redirect: "manual",
+      },
+    );
+    return env.APP_WORKER.fetch(proxyReq);
+  },
+
+  // ─── Service binding: MCP server ──────────────────────────────────
+  "mcp-w": async (request, env) => {
+    const headers = new Headers(request.headers);
+    const url = new URL(request.url);
+    const proxyReq = new Request(
+      new URL(url.pathname + url.search, "https://mcp-server.internal"),
+      {
+        method: request.method,
+        headers,
+        body: request.method !== "GET" && request.method !== "HEAD" ? request.body : null,
+        redirect: "manual",
+      },
+    );
+    return env.MCP_SERVER.fetch(proxyReq);
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Cloudflare Access authentication
@@ -411,6 +531,35 @@ const API_DOCS = [
   },
   {
     method: "ANY",
+    path: "/app/*",
+    description:
+      "Internal proxy to the app-worker via a service binding. " +
+      "The /app/ prefix is stripped (e.g. /app/api/users → /api/users). " +
+      "Handles users, audit logs, and settings. Used by the toqueui dashboard and CLI.",
+    auth: "CF Access JWT or APP_API_TOKEN (passed through)",
+  },
+  {
+    method: "ANY",
+    path: "/mcp/*",
+    description:
+      "Internal proxy to the MCP server via a service binding. " +
+      "The /mcp/ prefix is stripped (e.g. /mcp/ → /). " +
+      "Exposes the toque platform as MCP tools for AI agents (Claude, Copilot). " +
+      "Supports JSON-RPC 2.0 over HTTP (POST) and discovery (GET).",
+    auth: "MCP_API_TOKEN or CF Access JWT (passed through)",
+  },
+  {
+    method: "GET",
+    path: "/ui/*",
+    description:
+      "Internal proxy to the toque-ui Worker via a service binding. " +
+      "Serves the Next.js dashboard (HTML/CSS/JS). The /ui/ prefix is " +
+      "stripped (e.g. /ui/entities → /entities). The UI Worker proxies " +
+      "API calls back to this Worker via its own service binding (full mesh).",
+    auth: "none (static assets); API calls inherit auth from the browser",
+  },
+  {
+    method: "ANY",
     path: "/* (all other paths)",
     description:
       "All other requests are proxied to the Toque container, which handles: /pull, /info, /send, /api, /request, /groups, /login, /verify-login, /captcha/solve, /captcha/balance, /schedule, /cmd, /cmd/list, /api-list, /health",
@@ -447,50 +596,6 @@ async function handleWorkflowRoutes(url, request) {
   return null;
 }
 
-/**
- * Proxy /autha/* requests to the autha-worker via a service binding.
- *
- * The service binding (env.AUTHA_WORKER) sends requests directly within
- * Cloudflare's network — no public internet round-trip. The /autha/ prefix
- * is stripped, so `/autha/api/entity/123/context` becomes
- * `/api/entity/123/context` on the autha-worker.
- *
- * The WORKER_API_TOKEN is injected automatically from the Worker's secret,
- * so the container doesn't need to send it over the network. If the
- * incoming request already has an Authorization header, it's preserved
- * (allows the CLI to use its own token when running locally).
- */
-function proxyToAuthaWorker(request, url) {
-  if (!env.AUTHA_WORKER) {
-    return jsonResponse(500, {
-      ok: false,
-      error: "AUTHA_WORKER service binding not configured",
-    });
-  }
-
-  // Strip the /autha/ prefix
-  const targetPath = url.pathname.replace(/^\/autha/, "") + url.search;
-
-  // Build the forwarded request — preserve method, body, and most headers
-  const headers = new Headers(request.headers);
-  // Inject the API token if not already present
-  if (!headers.has("Authorization") && env.WORKER_API_TOKEN) {
-    headers.set("Authorization", `Bearer ${env.WORKER_API_TOKEN}`);
-  }
-
-  const proxyRequest = new Request(
-    new URL(targetPath, "https://autha-worker.internal"),
-    {
-      method: request.method,
-      headers,
-      body: request.method !== "GET" && request.method !== "HEAD" ? request.body : null,
-      redirect: "manual",
-    }
-  );
-
-  return env.AUTHA_WORKER.fetch(proxyRequest);
-}
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -501,7 +606,10 @@ export default {
     // WORKER_API_TOKEN via the service binding. The container itself has no
     // X-API-Key to send (it's internal), so auth would block it.
     const isAuthaProxy = url.pathname.startsWith("/autha/");
-    if (!isAuthaProxy) {
+    const isAppProxy = url.pathname.startsWith("/app/");
+    const isMcpProxy = url.pathname.startsWith("/mcp/");
+    const isUiProxy = url.pathname.startsWith("/ui");
+    if (!isAuthaProxy && !isAppProxy && !isMcpProxy && !isUiProxy) {
       const authError = await authenticate(request, url);
       if (authError) return authError;
     }
@@ -527,7 +635,32 @@ export default {
     // forwarding. The container's AuthaWorker client points WORKER_URL at
     // this Worker's /autha path when AUTHA_PROXY_MODE is set.
     if (url.pathname.startsWith("/autha/")) {
-      return proxyToAuthaWorker(request, url);
+      return proxyToAuthaWorker(request, url, env);
+    }
+
+    // --- App-worker proxy (service binding) ---
+    // Forwards /app/* requests to the app-worker (users, audit logs,
+    // settings) via a service binding. The /app/ prefix is stripped.
+    // Used by the toqueui dashboard and CLI clients.
+    if (url.pathname.startsWith("/app/")) {
+      return proxyToAppWorker(request, url, env);
+    }
+
+    // --- MCP server proxy (service binding) ---
+    // Forwards /mcp/* requests to the MCP server (AI agent tools) via a
+    // service binding. The /mcp/ prefix is stripped. Auth is passed through.
+    if (url.pathname.startsWith("/mcp/")) {
+      return proxyToMcpServer(request, url, env);
+    }
+
+    // --- UI Worker proxy (service binding) ---
+    // Forwards /ui/* requests to the toque-ui Worker, which serves the
+    // Next.js dashboard. The /ui/ prefix is stripped. This lets the
+    // dashboard be served from the main toque Worker URL without a
+    // separate public URL. The UI Worker proxies API calls back to this
+    // Worker via its own TOQUE_WORKER service binding (full mesh).
+    if (url.pathname.startsWith("/ui") || url.pathname === "/ui") {
+      return proxyToUiWorker(request, url, env);
     }
 
     // --- Proxy everything else to the Toque container ---

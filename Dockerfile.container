@@ -1,0 +1,180 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Toque — Full-stack container image (Ubuntu 24.04)
+#
+# Runs the entire project in one container:
+#   - Node.js HTTP server (port 8080) — Nusuk CLI + browser automation
+#   - SSH server (port 2222) — remote access for debugging/management
+#   - tigrisfs mount — R2 bucket mounted at /mnt/r2
+#
+# The container is managed by Cloudflare Containers and called via
+# service bindings (env.TOQUE_CONTAINER.getByName("toque").fetch()),
+# NOT via public URLs. SSH is exposed via wrangler.jsonc `ssh.enabled`.
+# ═══════════════════════════════════════════════════════════════════════
+
+FROM ubuntu:24.04
+
+# Avoid interactive prompts during apt install
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── System packages ─────────────────────────────────────────────────
+# SSH server, FUSE (for tigrisfs), browser deps, fonts, curl, tini
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  openssh-server \
+  fuse3 \
+  libatk1.0-0t64 \
+  libatk-bridge2.0-0t64 \
+  libcups2t64 \
+  libdrm2 \
+  libdbus-1-3 \
+  libxkbcommon0 \
+  libxcomposite1 \
+  libxdamage1 \
+  libxrandr2 \
+  libgbm1 \
+  libpango-1.0-0 \
+  libcairo2 \
+  libnspr4 \
+  libnss3 \
+  libxfixes3 \
+  libasound2t64 \
+  libx11-xcb1 \
+  libxcb1 \
+  libxext6 \
+  libxrender1 \
+  libxtst6 \
+  libxi6 \
+  libxss1 \
+  fonts-noto-color-emoji \
+  fonts-freefont-ttf \
+  fonts-unifont \
+  fonts-ipafont-gothic \
+  fonts-wqy-zenhei \
+  fonts-tlwg-loma-otf \
+  ca-certificates \
+  curl \
+  bash \
+  tini \
+  procps \
+  && rm -rf /var/lib/apt/lists/*
+
+# ─── Node.js 24 ───────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && rm -rf /var/lib/apt/lists/* \
+  && node --version \
+  && npm --version
+
+# ─── SSH server setup ─────────────────────────────────────────────────
+# Configure SSH on port 2222, disable password auth (key-only)
+RUN mkdir -p /run/sshd \
+  && sed -i 's/^#Port 22/Port 2222/' /etc/ssh/sshd_config \
+  && sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config \
+  && sed -i 's/^#PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config \
+  && sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+# Generate SSH host keys at build time so sshd can start without root keygen at runtime.
+# The startup script runs as root to launch sshd, then drops to the toque user for the
+# Node.js server (see startup.sh below).
+RUN ssh-keygen -A
+
+# Authorized keys are injected at runtime via the TOQUE_SSH_KEYS env var
+# (set by the Worker's envVars) or mounted as a secret. The startup script
+# reads them and writes to ~/.ssh/authorized_keys.
+#
+# Cloudflare Containers also injects authorized_keys via wrangler.jsonc
+# `ssh.authorized_keys` — those are placed by the platform automatically.
+
+EXPOSE 2222
+
+# ─── tigrisfs (R2 FUSE mount) ─────────────────────────────────────────
+# Install tigrisfs binary for mounting R2 buckets as a filesystem.
+# This enables the container to read/write R2 objects as local files at
+# /mnt/r2 without S3 API calls. The install is best-effort: if the GitHub
+# API is rate-limited or the download fails, the build still succeeds and
+# the R2 mount is simply skipped at runtime (startup.sh checks for the binary).
+RUN set -e; \
+  ARCH=$(uname -m) && \
+  if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi && \
+  if [ "$ARCH" = "aarch64" ]; then ARCH="arm64"; fi && \
+  VERSION=$(curl -fsSL https://api.github.com/repos/tigrisdata/tigrisfs/releases/latest | grep -o '"tag_name": "[^"]*' | cut -d'"' -f4) && \
+  curl -fsSL "https://github.com/tigrisdata/tigrisfs/releases/download/${VERSION}/tigrisfs_${VERSION#v}_linux_${ARCH}.tar.gz" -o /tmp/tigrisfs.tar.gz && \
+  tar -xzf /tmp/tigrisfs.tar.gz -C /usr/local/bin/ && \
+  rm /tmp/tigrisfs.tar.gz && \
+  chmod +x /usr/local/bin/tigrisfs \
+  || echo "[build] tigrisfs install skipped (download unavailable) — R2 mount disabled"
+
+# ─── Application ──────────────────────────────────────────────────────
+WORKDIR /app
+
+# Copy dependency manifests first for layer caching
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# Pre-download CloakBrowser stealth Chromium (~200MB) during build
+# so first request doesn't pay the download cost
+ENV CLOAKBROWSER_SUPPRESS_FONT_WARNING=1
+RUN npx cloakbrowser install || true
+
+# Copy application code
+COPY . .
+
+# Create non-root user
+RUN groupadd -r toque && useradd -r -g toque -m -s /bin/bash toque \
+  && cp -r /root/.cloakbrowser /home/toque/.cloakbrowser 2>/dev/null || true \
+  && chown -R toque:toque /app /home/toque
+
+# Put CLI and node_modules/.bin on PATH for both server and SSH sessions
+RUN ln -s /app/bin/nusuk.js /app/bin/nusuk \
+  && echo 'export PATH="/app/bin:/app/node_modules/.bin:$PATH"' > /etc/profile.d/toque-path.sh \
+  && chmod 755 /etc/profile.d/toque-path.sh
+ENV PATH="/app/bin:/app/node_modules/.bin:${PATH}"
+
+# ─── Startup script ───────────────────────────────────────────────────
+# Runs as root to start sshd (needs root for host keys / port 2222) and mount
+# R2 via tigrisfs (needs root for /mnt/r2), then drops to the toque user via
+# `exec gosu toque node ...` for the HTTP server.
+RUN printf '#!/bin/bash\n\
+set -e\n\
+\n\
+# ─── Start SSH daemon ──────────────────────────────────────────────\n\
+echo "[startup] Starting SSH on port 2222…"\n\
+/usr/sbin/sshd\n\
+\n\
+# ─── Mount R2 bucket via tigrisfs (if configured) ─────────────────\n\
+if [ -n "$R2_BUCKET_NAME" ] && [ -n "$R2_ACCOUNT_ID" ] && [ -x /usr/local/bin/tigrisfs ]; then\n\
+  mkdir -p /mnt/r2\n\
+  R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"\n\
+  echo "[startup] Mounting R2 bucket ${R2_BUCKET_NAME} at /mnt/r2…"\n\
+  /usr/local/bin/tigrisfs \\\n\
+    --endpoint "${R2_ENDPOINT}" \\\n\
+    --access-key "${R2_ACCESS_KEY_ID:-}" \\\n\
+    --secret-key "${R2_SECRET_ACCESS_KEY:-}" \\\n\
+    -f "${R2_BUCKET_NAME}" /mnt/r2 &\n\
+  sleep 2\n\
+  echo "[startup] R2 mounted. Contents:"\n\
+  ls -lah /mnt/r2 2>/dev/null || echo "[startup] /mnt/r2 empty or not yet ready"\n\
+else\n\
+  echo "[startup] R2 mount skipped (not configured or tigrisfs unavailable)"\n\
+fi\n\
+\n\
+# ─── Start the Node.js HTTP server (drop to toque user) ────────────\n\
+echo "[startup] Starting Toque server on port ${PORT:-8080}…"\n\
+exec gosu toque node src/server.js\n\
+' > /app/startup.sh && chmod +x /app/startup.sh
+
+# ─── Runtime ───────────────────────────────────────────────────────────
+# Startup runs as root (needed for sshd + tigrisfs mount); the startup script
+# drops to the toque user via gosu before starting the Node.js server.
+# Install gosu for a clean privilege drop.
+RUN apt-get update && apt-get install -y --no-install-recommends gosu \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV PORT=8080
+ENV NODE_ENV=production
+
+# Expose HTTP (8080) and SSH (2222)
+EXPOSE 8080 2222
+
+# tini as PID 1 for proper signal handling
+ENTRYPOINT ["tini", "--"]
+CMD ["/app/startup.sh"]

@@ -1,0 +1,21 @@
+name = "toqueui"
+compatibility_date = "2026-08-08"
+compatibility_flags = ["nodejs_compat"]
+
+# Cloudflare Pages configuration for the Next.js dashboard
+# Deployed as a Pages project with static assets + edge functions
+
+# Environment variables (set via `wrangler pages secret put` or dashboard):
+#   TOQUE_WORKER_URL — the toque Worker URL (https://toque.decloud.workers.dev)
+#   NEXT_PUBLIC_TOQUE_WORKER_URL — same, exposed to client-side
+
+[build]
+command = "npm run build"
+cwd = "packages/toqueui"
+
+[site]
+bucket = ".next"
+entry-point = "."
+
+[vars]
+NEXT_PUBLIC_TOQUE_WORKER_URL = "https://toque.decloud.workers.dev"

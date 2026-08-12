@@ -1,0 +1,16 @@
+{
+  "name": "autha-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Autha Cloudflare Worker — D1 REST API for auth/captcha token storage",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

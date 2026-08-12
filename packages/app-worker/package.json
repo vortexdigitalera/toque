@@ -1,0 +1,22 @@
+{
+  "name": "@toque/app-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "App Worker — D1-backed users, audit logs, and settings for the toqueui dashboard. Replaces Supabase.",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "db:migrate": "npx wrangler d1 migrations apply app_db --local",
+    "db:migrate:remote": "npx wrangler d1 migrations apply app_db --remote"
+  },
+  "dependencies": {
+    "@toque/shared": "file:../shared"
+  },
+  "devDependencies": {
+    "wrangler": "^4.120.0"
+  }
+}

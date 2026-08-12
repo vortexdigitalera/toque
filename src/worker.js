@@ -40,6 +40,12 @@ export class AuthaWorker {
       "default";
     this.apiToken = config.apiToken || process.env.WORKER_API_TOKEN || "";
     this._contextCache = new Map();
+    // Direct D1 mode: when a D1 binding is available (e.g. in the Worker
+    // runtime), query the database directly instead of making an HTTP
+    // request to the autha-worker. This eliminates the service-binding
+    // round-trip for token pulls, reducing latency by ~10-20ms.
+    // Set via `new AuthaWorker({ d1: env.AUTHA_DB })` in the Worker.
+    this.d1 = config.d1 || null;
   }
 
   _readEntityFile() {
@@ -78,6 +84,71 @@ export class AuthaWorker {
     return json;
   }
 
+  /**
+   * Query D1 directly for an entity's latest auth + captcha records.
+   * Only used when a D1 binding is available (Worker runtime).
+   * Bypasses the HTTP round-trip to the autha-worker entirely.
+   * @param {string} entityId
+   * @returns {Promise<object>} context object
+   */
+  async _getD1Context(entityId) {
+    const result = await this.d1
+      .prepare(
+        `SELECT key, value, timestamp FROM records
+         WHERE key LIKE ? || '_%'
+         ORDER BY timestamp DESC
+         LIMIT 50`,
+      )
+      .bind(`entity_${entityId}_`)
+      .all();
+
+    const records = result.results || [];
+    const context = {
+      ok: true,
+      entityId,
+      auth: null,
+      captcha: {},
+      entity: {},
+    };
+
+    for (const r of records) {
+      let parsed;
+      try {
+        parsed = JSON.parse(r.value);
+      } catch {
+        continue;
+      }
+      const action = String(parsed.action || parsed.metadata?.action || "").toUpperCase();
+
+      if (action.includes("AUTH_TOKEN") || action.includes("SYNC")) {
+        if (!context.auth || r.timestamp > (context.auth.timestamp || 0)) {
+          context.auth = {
+            token: parsed.token || parsed.userToken || parsed.value,
+            timestamp: r.timestamp,
+            tokenType: parsed.tokenType,
+          };
+          context.entityId = parsed.entityId || parsed.activeEntityId || context.entityId;
+          context.entity = {
+            entityId: context.entityId,
+            activeEntityId: parsed.activeEntityId || context.entityId,
+            entityTypeId: parsed.entityTypeId,
+            activeEntityTypeId: parsed.activeEntityTypeId,
+          };
+        }
+      }
+
+      if (action.includes("CAPTCHA")) {
+        const type = parsed.captchaType || "visa";
+        if (!context.captcha[type] || r.timestamp > (context.captcha.timestamp || 0)) {
+          context.captcha[type] = { captchaToken: parsed.token || parsed.value };
+          context.captcha.timestamp = r.timestamp;
+        }
+      }
+    }
+
+    return context;
+  }
+
   async fetchContext(entityId, { refresh = false } = {}) {
     const eid = entityId || this.entityId;
     if (!eid) throw new Error("Entity ID required (pass entityId or --entity)");
@@ -85,7 +156,13 @@ export class AuthaWorker {
     if (!refresh && this._contextCache.has(cacheKey)) {
       return this._contextCache.get(cacheKey);
     }
-    const context = await this._get(`/api/entity/${encodeURIComponent(cacheKey)}/context`);
+    // Direct D1 mode: skip HTTP entirely when a D1 binding is available
+    let context;
+    if (this.d1) {
+      context = await this._getD1Context(cacheKey);
+    } else {
+      context = await this._get(`/api/entity/${encodeURIComponent(cacheKey)}/context`);
+    }
     this._contextCache.set(cacheKey, context);
     return context;
   }
