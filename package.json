@@ -38,7 +38,7 @@
     "@cloudflare/containers": "^0.3.7",
     "@tailwindcss/postcss": "^4.3.3",
     "@zennolab_com/capmonstercloud-client": "^2.8.0",
-    "cloakbrowser": "^0.5.7",
+    "cloakbrowser": "^0.5.9",
     "dotenv": "^17.2.3",
     "jose": "^6.2.8",
     "lucide-react": "^1.31.0",
